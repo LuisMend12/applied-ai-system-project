@@ -1,4 +1,14 @@
-"""AI assistant module: RAG retrieval + Claude-powered music recommendations."""
+"""
+AI assistant: multi-source RAG retrieval + Claude-powered recommendations.
+
+Agentic workflow (each step is recorded and returned for UI display):
+  1. RAG — score and rank songs from the catalog
+  2. RAG — retrieve relevant context from the music knowledge base
+  3. Build prompt with few-shot examples for the selected personality mode
+  4. Call Claude Haiku
+  5. Parse and validate JSON response
+  6. Compute and clamp confidence score
+"""
 
 import json
 import logging
@@ -7,6 +17,7 @@ from typing import Dict, List, Optional, Tuple
 
 import anthropic
 
+from knowledge_base import retrieve_knowledge_context
 from playlist_logic import Song
 
 logging.basicConfig(
@@ -19,32 +30,77 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ai_assistant")
 
-# Mood-to-genre/tag keyword mapping used during RAG scoring
+# ---------------------------------------------------------------------------
+# Personality modes — few-shot examples that specialize Claude's tone/style
+# ---------------------------------------------------------------------------
+
+FEW_SHOT_EXAMPLES: Dict[str, str] = {
+    "standard": (
+        'Example — input: "something calm for studying"\n'
+        'Output: {"recommended_songs": ["Lo-fi Rain", "Take Five"], '
+        '"reasoning": "Lo-fi and jazz instrumentals provide calm, non-distracting '
+        'background sound ideal for sustained concentration.", '
+        '"mood_label": "Chill", "confidence": 0.9}'
+    ),
+    "dj": (
+        'Example — input: "something calm for studying"\n'
+        'Output: {"recommended_songs": ["Lo-fi Rain", "Take Five"], '
+        '"reasoning": "Dropping these smooth low-key cuts — the lo-fi vibes and '
+        'cool jazz will keep your brain locked in without killing the vibe.", '
+        '"mood_label": "Chill", "confidence": 0.9}'
+    ),
+    "wellness": (
+        'Example — input: "something calm for studying"\n'
+        'Output: {"recommended_songs": ["Gymnopedie No.1", "Lo-fi Rain"], '
+        '"reasoning": "These calming, low-energy pieces support cognitive focus and '
+        'reduce cortisol, creating an optimal neurological environment for deep work.", '
+        '"mood_label": "Chill", "confidence": 0.9}'
+    ),
+}
+
+PERSONALITY_SYSTEM_SUFFIX: Dict[str, str] = {
+    "standard": "Respond in a clear, friendly tone.",
+    "dj": (
+        "Respond as an enthusiastic DJ. Use casual, high-energy language with "
+        "DJ slang (e.g., 'dropping', 'vibes', 'locked in', 'fire track'). "
+        "Keep reasoning energetic and fun."
+    ),
+    "wellness": (
+        "Respond as a music therapist / wellness coach. Use calm, scientific-sounding "
+        "language. Reference how music affects mood, focus, or energy physiologically. "
+        "Keep reasoning thoughtful and health-oriented."
+    ),
+}
+
+# ---------------------------------------------------------------------------
+# Mood-to-genre/tag keyword mapping for catalog scoring (RAG step 1)
+# ---------------------------------------------------------------------------
+
 MOOD_KEYWORDS: Dict[str, List[str]] = {
     "study": ["lofi", "ambient", "calm", "instrumental", "focus", "piano"],
     "focus": ["lofi", "instrumental", "ambient", "jazz", "classical"],
     "workout": ["rock", "electronic", "hype", "pump", "intense", "trance"],
-    "gym": ["rock", "electronic", "hype", "pump", "intense"],
+    "gym": ["rock", "electronic", "pump", "intense"],
     "sleep": ["ambient", "calm", "sleep", "relax", "piano", "classical"],
     "relax": ["ambient", "jazz", "chill", "calm", "lofi"],
-    "party": ["pop", "dance", "electronic", "funk", "hype"],
+    "party": ["pop", "dance", "electronic", "funk"],
     "dance": ["pop", "electronic", "funk", "dance"],
     "sad": ["ambient", "chill", "calm", "piano"],
-    "happy": ["pop", "funk", "dance", "upbeat"],
+    "happy": ["pop", "funk", "dance"],
     "drive": ["rock", "electronic", "pop", "synth"],
-    "morning": ["pop", "jazz", "calm", "upbeat"],
+    "morning": ["pop", "jazz", "calm"],
     "night": ["electronic", "ambient", "synth", "dream"],
-    "chill": ["lofi", "ambient", "jazz", "chill"],
-    "hype": ["rock", "electronic", "pop", "punk", "dance"],
+    "chill": ["lofi", "ambient", "jazz"],
+    "hype": ["rock", "electronic", "pop", "punk"],
 }
 
 
 def retrieve_relevant_songs(
     query: str, songs: List[Song], top_k: int = 8
-) -> List[Song]:
+) -> Tuple[List[Song], List[Tuple[str, int]]]:
     """
-    RAG retrieval step: score every song in the catalog by relevance to the
-    user's free-text query, then return the top_k candidates.
+    RAG step 1: score every catalog song by keyword overlap with the query.
+    Returns (top_k songs, [(title, score), ...] for the step trace).
     """
     query_lower = query.lower()
     scored: List[Tuple[int, Song]] = []
@@ -85,14 +141,12 @@ def retrieve_relevant_songs(
 
     scored.sort(key=lambda x: x[0], reverse=True)
     retrieved = [s for _, s in scored[:top_k]]
+    top_scores = [(str(s.get("title", "")), sc) for sc, s in scored[:3]]
     logger.info(
-        "RAG retrieval: query=%r → %d/%d songs (top scores: %s)",
-        query,
-        len(retrieved),
-        len(songs),
-        [sc for sc, _ in scored[:3]],
+        "RAG catalog: query=%r → %d/%d songs (top: %s)",
+        query, len(retrieved), len(songs), top_scores,
     )
-    return retrieved
+    return retrieved, top_scores
 
 
 def _catalog_text(songs: List[Song]) -> str:
@@ -111,43 +165,57 @@ def get_ai_recommendation(
     songs: List[Song],
     profile: Dict,
     client: anthropic.Anthropic,
+    personality: str = "standard",
 ) -> Dict:
     """
-    Agentic workflow:
-      1. Retrieve relevant songs via RAG scoring
-      2. Build a context-rich prompt from the retrieved catalog slice
-      3. Call Claude to reason over candidates and pick the best matches
-      4. Parse and validate the JSON response
-      5. Clamp / compute the confidence score
+    Full agentic workflow — returns a result dict including a 'steps' list so
+    the UI can display exactly what the agent did at each stage.
 
-    Returns a dict with keys: recommended_songs, reasoning, mood_label,
-    confidence, retrieved_count, query, error (on failure).
+    Keys in returned dict:
+      recommended_songs, reasoning, mood_label, confidence,
+      retrieved_count, knowledge_used, query, steps, error (on failure)
     """
-    logger.info(
-        "AI recommendation request: query=%r profile=%s",
-        user_query,
-        profile.get("name"),
+    steps: List[str] = []
+    logger.info("Request: query=%r personality=%s profile=%s", user_query, personality, profile.get("name"))
+
+    # ── Step 1: RAG — catalog retrieval ────────────────────────────────────
+    retrieved, top_scores = retrieve_relevant_songs(user_query, songs, top_k=8)
+    top_str = ", ".join(f'"{t}" (score {s})' for t, s in top_scores)
+    steps.append(
+        f"Step 1 [RAG — Catalog]: Scored {len(songs)} songs → "
+        f"selected top {len(retrieved)}. Highest matches: {top_str}."
     )
 
-    # Step 1 — RAG retrieval
-    retrieved = retrieve_relevant_songs(user_query, songs, top_k=8)
     if not retrieved:
-        logger.warning("Catalog is empty; cannot recommend.")
-        return {
-            "error": "No songs in catalog to recommend from.",
-            "recommended_songs": [],
-            "reasoning": "The song catalog is empty.",
-            "mood_label": "Mixed",
-            "confidence": 0.0,
-            "retrieved_count": 0,
-            "query": user_query,
-        }
+        steps.append("Step 1 aborted — catalog is empty.")
+        return _error("No songs in catalog to recommend from.", steps, user_query)
 
-    # Step 2 — Build prompt
+    # ── Step 2: RAG — knowledge base retrieval ─────────────────────────────
+    kb_entries = retrieve_knowledge_context(user_query, top_k=2)
+    if kb_entries:
+        kb_ids = ", ".join(e["id"] for e in kb_entries)
+        steps.append(
+            f"Step 2 [RAG — Knowledge Base]: Found {len(kb_entries)} relevant "
+            f"music knowledge entries: {kb_ids}."
+        )
+    else:
+        steps.append("Step 2 [RAG — Knowledge Base]: No matching knowledge entries for this query.")
+    knowledge_used = [e["id"] for e in kb_entries]
+
+    # ── Step 3: Build prompt ────────────────────────────────────────────────
     catalog = _catalog_text(retrieved)
+    kb_context = (
+        "\n\nMusic domain knowledge:\n"
+        + "\n".join(f'- {e["text"]}' for e in kb_entries)
+        if kb_entries
+        else ""
+    )
+    few_shot = FEW_SHOT_EXAMPLES.get(personality, FEW_SHOT_EXAMPLES["standard"])
+    persona_suffix = PERSONALITY_SYSTEM_SUFFIX.get(personality, PERSONALITY_SYSTEM_SUFFIX["standard"])
+
     system_prompt = (
-        "You are a music recommendation assistant with access to a song catalog. "
-        "Given a user's mood or activity, recommend songs from the provided catalog. "
+        f"You are a music recommendation assistant. {persona_suffix}\n"
+        "Given a user's mood or activity, recommend songs from the provided catalog.\n"
         "Respond ONLY with valid JSON matching this exact schema:\n"
         '{"recommended_songs": ["Title1", "Title2"], '
         '"reasoning": "one or two sentences", '
@@ -155,18 +223,25 @@ def get_ai_recommendation(
         '"confidence": 0.85}\n'
         "Rules:\n"
         "- Only recommend songs whose titles appear verbatim in the catalog.\n"
-        "- Recommend 2–4 songs.\n"
-        "- confidence is 0.0–1.0; reflect how well the catalog matched the request.\n"
-        "- Output raw JSON only — no markdown fences, no extra text."
+        "- Recommend 2-4 songs.\n"
+        "- confidence is 0.0-1.0; reflect how well the catalog matched the request.\n"
+        "- Output raw JSON only — no markdown fences, no extra text.\n\n"
+        f"Few-shot example:\n{few_shot}"
     )
     user_prompt = (
         f'User request: "{user_query}"\n\n'
-        f"Catalog ({len(retrieved)} most relevant songs):\n{catalog}\n\n"
+        f"Catalog ({len(retrieved)} most relevant songs):\n{catalog}"
+        f"{kb_context}\n\n"
         f"User's favorite genre: {profile.get('favorite_genre', 'any')}\n\n"
         "Respond with JSON only."
     )
+    steps.append(
+        f"Step 3 [Prompt Built]: personality={personality}, "
+        f"catalog_songs={len(retrieved)}, knowledge_entries={len(kb_entries)}."
+    )
 
-    # Step 3 — Claude API call
+    # ── Step 4: Claude API call ─────────────────────────────────────────────
+    steps.append(f"Step 4 [Claude API]: Calling claude-haiku-4-5 (personality={personality})…")
     try:
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -175,20 +250,14 @@ def get_ai_recommendation(
             messages=[{"role": "user", "content": user_prompt}],
         )
         raw = response.content[0].text.strip()
-        logger.info("Claude response (truncated): %s", raw[:300])
+        logger.info("Claude raw (truncated): %s", raw[:300])
+        steps.append(f"Step 4 [Claude API]: Response received ({len(raw)} chars).")
     except anthropic.APIError as exc:
         logger.error("Claude API error: %s", exc)
-        return {
-            "error": f"API error: {exc}",
-            "recommended_songs": [],
-            "reasoning": "",
-            "mood_label": "Mixed",
-            "confidence": 0.0,
-            "retrieved_count": len(retrieved),
-            "query": user_query,
-        }
+        steps.append(f"Step 4 [Claude API]: ERROR — {exc}")
+        return _error(f"API error: {exc}", steps, user_query)
 
-    # Step 4 — Parse JSON (strip markdown fences if present)
+    # ── Step 5: Parse and validate JSON ────────────────────────────────────
     text = raw
     if text.startswith("```"):
         parts = text.split("```")
@@ -197,44 +266,58 @@ def get_ai_recommendation(
         result: Dict = json.loads(text)
     except json.JSONDecodeError as exc:
         logger.error("JSON parse error: %s | raw=%r", exc, raw)
-        return {
-            "error": "Could not parse AI response.",
-            "recommended_songs": [],
-            "reasoning": raw,
-            "mood_label": "Mixed",
-            "confidence": 0.0,
-            "retrieved_count": len(retrieved),
-            "query": user_query,
-        }
+        steps.append(f"Step 5 [Validate]: JSON parse failed — {exc}")
+        return _error("Could not parse AI response.", steps, user_query)
 
-    # Step 5 — Validate songs exist in the full catalog
     title_map = {s["title"].lower(): s["title"] for s in songs}
-    validated = [
-        title_map[t.lower()]
-        for t in result.get("recommended_songs", [])
-        if t.lower() in title_map
-    ]
-    for t in result.get("recommended_songs", []):
-        if t.lower() not in title_map:
-            logger.warning("AI hallucinated song not in catalog: %r", t)
+    raw_recs = result.get("recommended_songs", [])
+    validated = [title_map[t.lower()] for t in raw_recs if t.lower() in title_map]
+    hallucinated = [t for t in raw_recs if t.lower() not in title_map]
 
-    result["recommended_songs"] = validated
-    result["retrieved_count"] = len(retrieved)
-    result["query"] = user_query
+    if hallucinated:
+        logger.warning("Hallucinated titles dropped: %s", hallucinated)
+    steps.append(
+        f"Step 5 [Validate]: {len(validated)}/{len(raw_recs)} songs validated against catalog"
+        + (f"; dropped hallucinations: {hallucinated}" if hallucinated else "") + "."
+    )
 
+    # ── Step 6: Confidence scoring ──────────────────────────────────────────
     conf = float(result.get("confidence", 0.7))
     if not validated:
         conf = 0.0
     elif len(validated) < 2:
         conf = min(conf, 0.5)
-    result["confidence"] = round(max(0.0, min(1.0, conf)), 2)
-
-    logger.info(
-        "Final recommendation: songs=%s confidence=%.2f",
-        validated,
-        result["confidence"],
+    conf = round(max(0.0, min(1.0, conf)), 2)
+    steps.append(
+        f"Step 6 [Result]: mood={result.get('mood_label', '?')} "
+        f"confidence={conf:.0%} songs={validated}."
     )
-    return result
+
+    logger.info("Done: songs=%s confidence=%.2f", validated, conf)
+    return {
+        "recommended_songs": validated,
+        "reasoning": result.get("reasoning", ""),
+        "mood_label": result.get("mood_label", "Mixed"),
+        "confidence": conf,
+        "retrieved_count": len(retrieved),
+        "knowledge_used": knowledge_used,
+        "query": user_query,
+        "steps": steps,
+    }
+
+
+def _error(msg: str, steps: List[str], query: str) -> Dict:
+    return {
+        "error": msg,
+        "recommended_songs": [],
+        "reasoning": "",
+        "mood_label": "Mixed",
+        "confidence": 0.0,
+        "retrieved_count": 0,
+        "knowledge_used": [],
+        "query": query,
+        "steps": steps,
+    }
 
 
 def get_client() -> Optional[anthropic.Anthropic]:

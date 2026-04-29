@@ -386,7 +386,7 @@ def clear_controls():
 
 
 def ai_assistant_section(songs, profile):
-    """AI-powered recommendation tab using RAG + Claude."""
+    """AI-powered recommendation tab: multi-source RAG + personality modes + agent step trace."""
     st.header("AI Music Assistant")
 
     client = _ai_client()
@@ -399,17 +399,32 @@ def ai_assistant_section(songs, profile):
 
     st.write(
         "Describe your mood or activity and get personalized song recommendations "
-        "powered by RAG retrieval + Claude AI."
+        "powered by multi-source RAG + Claude AI."
     )
 
-    query = st.text_input(
-        "What are you in the mood for?",
-        placeholder="e.g. studying late at night, intense gym session, chill Sunday morning…",
-    )
+    col_q, col_p = st.columns([3, 1])
+    with col_q:
+        query = st.text_input(
+            "What are you in the mood for?",
+            placeholder="e.g. studying late at night, intense gym session, chill Sunday morning…",
+        )
+    with col_p:
+        personality = st.selectbox(
+            "AI personality",
+            options=["standard", "dj", "wellness"],
+            format_func=lambda x: {"standard": "Standard", "dj": "DJ Mode", "wellness": "Wellness Coach"}[x],
+        )
 
     if st.button("Get Recommendation", type="primary") and query.strip():
-        with st.spinner("Retrieving songs and generating recommendation…"):
-            result = get_ai_recommendation(query.strip(), songs, profile, client)
+        with st.spinner("Running multi-source RAG + Claude…"):
+            result = get_ai_recommendation(query.strip(), songs, profile, client, personality=personality)
+
+        # Always show agent steps so the workflow is visible
+        with st.expander("Agent steps (agentic workflow trace)", expanded=False):
+            for step in result.get("steps", []):
+                st.markdown(f"- {step}")
+            if result.get("knowledge_used"):
+                st.markdown(f"**Knowledge base entries used:** {', '.join(result['knowledge_used'])}")
 
         if result.get("error"):
             st.error(result["error"])
@@ -420,10 +435,12 @@ def ai_assistant_section(songs, profile):
         recs = result.get("recommended_songs", [])
         reasoning = result.get("reasoning", "")
         retrieved_n = result.get("retrieved_count", 0)
+        kb_used = result.get("knowledge_used", [])
 
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         col1.metric("Detected Mood", mood)
         col2.metric("AI Confidence", f"{conf:.0%}")
+        col3.metric("Personality", personality.upper())
 
         if reasoning:
             st.write(f"**Why these songs:** {reasoning}")
@@ -442,9 +459,10 @@ def ai_assistant_section(songs, profile):
         else:
             st.warning("No matching songs found. Try broadening your description.")
 
-        st.caption(
-            f"RAG retrieved {retrieved_n} candidate songs from your catalog before generating this recommendation."
-        )
+        sources = f"catalog ({retrieved_n} songs)"
+        if kb_used:
+            sources += f" + knowledge base ({', '.join(kb_used)})"
+        st.caption(f"Multi-source RAG retrieved from: {sources}")
 
 
 def main():
